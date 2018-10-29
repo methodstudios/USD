@@ -96,6 +96,114 @@ struct _ViewportAttrFilter : public GT_GEOAttributeFilter
     }
 };
 
+struct UniformAttributeFilter : public GT_GEOAttributeFilter
+{
+    bool isValid(const GA_Attribute &attrib) const override
+    {
+        bool valid = attrib.getOwner() == GA_ATTRIB_PRIMITIVE;
+        return valid;
+    }
+};
+
+class GT_PrimInstanceUniformToConstant : public GT_PrimInstance
+{
+public:
+    GT_PrimInstanceUniformToConstant(
+            const GT_PrimitiveHandle &geometry,
+            const GT_TransformArrayHandle& transforms,
+            const GT_GEOOffsetList& packed_prim_offsets=GT_GEOOffsetList(),
+            const GT_AttributeListHandle& uniform=GT_AttributeListHandle(),
+            const GT_AttributeListHandle& detail=GT_AttributeListHandle(),
+            const GT_GEODetailListHandle& source=GT_GEODetailListHandle())
+        : GT_PrimInstance(geometry, transforms, packed_prim_offsets, uniform, detail, source)
+        , m_uniformAttrs(uniform)
+    {
+    }
+    
+    GT_PrimInstanceUniformToConstant(const GT_PrimInstanceUniformToConstant& src) = default;
+    
+    const char* className() const override
+    {
+        return "GT_PrimInstanceUniformToConstant";
+    }
+    
+    GT_AttributeListHandle promoteUniformToConstant(GT_AttributeListHandle dest_const, exint prim_index) const
+    {
+        if(dest_const && m_uniformAttrs)
+        {
+            for(int i{}; i<m_uniformAttrs->entries(); ++i)
+            {
+                const char* attrib_name = m_uniformAttrs->getName(i);
+                GT_DataArrayHandle attrib_data = m_uniformAttrs->get(i);
+                
+                dest_const = dest_const->addAttribute(attrib_name,
+                                          new GT_DASubArray(attrib_data, prim_index, 1),
+                                          true /* replace existing */);
+            }
+        }
+        
+        return dest_const;
+    }
+    
+    bool refine(GT_Refine& refiner, const GT_RefineParms* parms) const override
+    {
+        GT_RefineCollect refineCollect;
+        GT_PrimInstance::refine(refineCollect, parms);
+        
+        for(exint i{}; i<refineCollect.entries(); ++i)
+        {
+            GT_PrimitiveHandle prim = refineCollect.getPrim(i);
+            
+            switch(prim->getPrimitiveType())
+            {
+                case GT_PRIM_INSTANCE:
+                {
+                    auto primInst = UTverify_cast<const GT_PrimInstance*>(prim.get());
+                    prim.reset(new GT_PrimInstanceUniformToConstant(
+                               primInst->geometry(),
+                               primInst->transforms(),
+                               primInst->packedPrimOffsets(),
+                               m_uniformAttrs));
+                    break;
+                }
+                case GT_PRIM_SUBDIVISION_MESH:
+                {
+                    auto primSubdMesh = UTverify_cast<const GT_PrimSubdivisionMesh*>(prim.get());
+                    prim.reset(new GT_PrimSubdivisionMesh(
+                               *primSubdMesh,
+                               primSubdMesh->getShared(),
+                               primSubdMesh->getVertex(),
+                               primSubdMesh->getUniform(),
+                               promoteUniformToConstant( primSubdMesh->getDetail(), i )));
+                    break;
+                }
+                case GT_PRIM_POLYGON_MESH:
+                {
+                    auto primPolyMesh = UTverify_cast<const GT_PrimPolygonMesh*>(prim.get());
+                    prim.reset(new GT_PrimPolygonMesh(
+                               *primPolyMesh,
+                               primPolyMesh->getShared(),
+                               primPolyMesh->getVertex(),
+                               primPolyMesh->getUniform(),
+                               promoteUniformToConstant( primPolyMesh->getDetail(), i )));
+                    break;
+                }
+                default:
+                {
+                    break;
+                }
+            }
+            
+            refiner.addPrimitive(prim);
+        }
+        
+        return true;
+    }
+    
+private:
+    GT_AttributeListHandle m_uniformAttrs;
+};
+
 // GT_PrimInstanceWithColor is used to visualize PackedUSD prims which have a
 // Cd attribute assigned. Unlike GT_PrimInstance, it will pass down Cd when it
 // refines. This scheme breaks GL instancing and is potentially much slower to
@@ -328,14 +436,14 @@ public:
         }
 
         // Copy __primitive_id attribute to support viewport picking
-        _ViewportAttrFilter filter;
+        UniformAttributeFilter filter;
         GT_AttributeListHandle uniformAttrs 
             = _geometry->getPrimitiveVertexAttributes(
                     filter, primOffsetList, vtxOffsetList);
 
         GT_PrimInstance* gtInst;
-        if( uniformAttrs->hasName( "Cd" )) {
-            gtInst = new GT_PrimInstanceWithColor( 
+        if( uniformAttrs->entries() > 0 ) {
+            gtInst = new GT_PrimInstanceUniformToConstant(
                                 geo, 
                                 xformArray, 
                                 primOffsetList, 
